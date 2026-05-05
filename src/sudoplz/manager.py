@@ -17,6 +17,8 @@ from pathlib import Path
 from sudoplz.core import (
     AGE_ENCRYPTED_FILE,
     AUDIT_LOG_FILE,
+    CONFIG_DIR,
+    CONFIG_FILE,
     SERVICE_NAME,
     SSH_ENCRYPTED_FILE,
     USERNAME,
@@ -24,6 +26,7 @@ from sudoplz.core import (
     find_ssh_key,
     generate_totp_secret,
     has_age,
+    load_config,
     load_totp_secret,
     save_totp_secret,
     verify_totp,
@@ -251,6 +254,36 @@ def cmd_test(_args: argparse.Namespace) -> bool:
     return False
 
 
+def cmd_config(args: argparse.Namespace) -> bool:
+    config = load_config()
+
+    if args.show:
+        print(json.dumps(config, indent=2))
+        return True
+
+    if args.no_expire:
+        new_value = 0
+    elif args.expire_hours is not None:
+        if args.expire_hours < 0:
+            print("Error: --expire-hours must be 0 or positive (0 disables)", file=sys.stderr)
+            return False
+        new_value = args.expire_hours
+    else:
+        print("Error: specify --show, --no-expire, or --expire-hours N", file=sys.stderr)
+        return False
+
+    config["expiration_hours"] = new_value
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
+    CONFIG_FILE.chmod(0o600)
+
+    if new_value == 0:
+        print("Expiration disabled. Stored password will not auto-delete.")
+    else:
+        print(f"Expiration set to {new_value} hours.")
+    return True
+
+
 def cmd_audit(_args: argparse.Namespace) -> bool:
     if not AUDIT_LOG_FILE.exists():
         print("No audit log found")
@@ -291,6 +324,22 @@ def main() -> None:
     for name, help_text, fn in commands:
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=fn)
+
+    config_parser = sub.add_parser("config", help="View or modify sudoplz configuration")
+    config_group = config_parser.add_mutually_exclusive_group(required=True)
+    config_group.add_argument("--show", action="store_true", help="Print current configuration")
+    config_group.add_argument(
+        "--no-expire",
+        action="store_true",
+        help="Disable password expiration (sets expiration_hours = 0)",
+    )
+    config_group.add_argument(
+        "--expire-hours",
+        type=int,
+        metavar="N",
+        help="Set password expiration in hours (0 disables auto-delete)",
+    )
+    config_parser.set_defaults(func=cmd_config)
 
     args = parser.parse_args()
     sys.exit(0 if args.func(args) else 1)
