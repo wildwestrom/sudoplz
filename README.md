@@ -20,7 +20,7 @@ This threat model assumes a personal workstation with an encrypted disk and a pa
 
 ## Installation
 
-1. **Use traditional `sudo`, not `sudo-rs`.** `sudo-rs` doesn't support askpass. Check with `sudo --version` — it should say "Sudo version 1.x.x". If you're on `sudo-rs`, switch:
+1. **If you're on `sudo-rs`, make sure it's version 0.2.11 or newer.** Earlier `sudo-rs` releases don't support the `-A`/`--askpass` flag. Check with `sudo --version`. On a slow-to-release distro (e.g. Debian) with an older packaged `sudo-rs`, switch to traditional `sudo`:
    ```bash
    sudo update-alternatives --install /usr/bin/sudo sudo /usr/bin/sudo.ws 100
    sudo update-alternatives --config sudo   # pick sudo.ws
