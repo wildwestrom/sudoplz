@@ -1,10 +1,8 @@
 {
-  "require_user_confirmation": true,
   "allowed_paths": [
     "/tmp/",
     "/var/tmp/"
   ],
-  "expiration_hours": 168,
   "allowed_processes": [
     "sudo",
     "bash",

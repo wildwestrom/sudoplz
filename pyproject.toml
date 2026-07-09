@@ -1,7 +1,7 @@
 [project]
 name = "sudoplz"
 version = "0.3.0"
-description = "Give AI coding agents case-by-case sudo access via GUI approval, with SSH-key-encrypted password storage"
+description = "Give AI coding agents case-by-case sudo access via a real GUI password prompt"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -26,9 +26,7 @@ classifiers = [
     "Topic :: System :: Systems Administration :: Authentication/Directory",
     "Topic :: Utilities",
 ]
-dependencies = [
-    "keyring>=24",
-]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/crypdick/sudoplz"

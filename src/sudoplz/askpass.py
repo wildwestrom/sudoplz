@@ -1,152 +1,108 @@
 """Askpass helper invoked by ``sudo -A``.
 
-Prints the stored sudo password to stdout after passing security checks.
+Pops a GUI password prompt showing the exact command about to run, then
+prints whatever the user typed to stdout. Sudo itself validates the
+password against the system — this script never stores or checks it.
 Never write anything else to stdout — sudo treats stray output as the
 password.
 """
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import socket
 import subprocess
 import sys
 import syslog
-import tempfile
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from sudoplz.core import (
-    AGE_ENCRYPTED_FILE,
     AUDIT_LOG_FILE,
     RATE_LIMIT_FILE,
-    SERVICE_NAME,
-    SSH_ENCRYPTED_FILE,
-    USERNAME,
-    age_decrypt,
-    find_ssh_key,
-    has_age,
     load_config,
-    load_totp_secret,
     parent_command,
     process_name,
-    verify_totp,
 )
-
-try:
-    import keyring
-
-    HAS_KEYRING = True
-except ImportError:
-    HAS_KEYRING = False
 
 
 def repair_environment() -> None:
     """Restore env vars that ``sudo -A`` strips but our subprocesses need."""
-    if sys.platform == "linux" and not os.environ.get("SSH_AUTH_SOCK"):
-        sock = f"/run/user/{os.getuid()}/openssh_agent"
-        if os.path.exists(sock):
-            os.environ["SSH_AUTH_SOCK"] = sock
     if sys.platform == "darwin":
         brew = "/opt/homebrew/bin"
         if os.path.isdir(brew) and brew not in os.environ.get("PATH", ""):
             os.environ["PATH"] = f"{brew}:{os.environ.get('PATH', '')}"
 
 
-def show_dialog(user: str, host: str, command: str) -> bool:
-    """Prompt the user for approval. Return True on Allow."""
-    message = (
-        "Administrator privileges requested\n\n"
-        f"User: {user}\nHost: {host}\nCommand: {command}\n\n"
-        "Do you want to allow this?"
-    )
+def prompt_password_gui(user: str, host: str, command: str) -> str | None:
+    """Show a GUI password prompt. Return the typed password, or None on cancel/error."""
+    message = f"User: {user}\nHost: {host}\nCommand: {command}\n\nSudo password:"
 
     if sys.platform == "darwin":
         escaped = message.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
         script = (
             'tell application "System Events"\nactivate\n'
             f'display dialog "{escaped}" '
+            'default answer "" with hidden answer '
             'with title "Sudo Authentication Required" '
-            'buttons {"Deny", "Allow"} default button "Deny" '
             "with icon caution giving up after 30\nend tell"
         )
         try:
             result = subprocess.run(
                 ["osascript", "-e", script], capture_output=True, text=True, timeout=35
             )
-            return result.returncode == 0 and "Allow" in result.stdout
+            if result.returncode != 0:
+                return None
+            for part in result.stdout.split(", "):
+                if part.startswith("text returned:"):
+                    return part.removeprefix("text returned:").rstrip("\n")
+            return None
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            syslog.syslog(syslog.LOG_WARNING, f"osascript dialog failed: {e}")
-            return False
+            syslog.syslog(syslog.LOG_WARNING, f"osascript password dialog failed: {e}")
+            return None
 
     if "DISPLAY" not in os.environ:
-        return False
+        return None
 
     try:
         result = subprocess.run(
             [
                 "zenity",
-                "--question",
+                "--password",
                 "--title=Sudo Authentication Required",
                 f"--text={message}",
-                "--width=450",
-                "--ok-label=Allow",
-                "--cancel-label=Deny",
             ],
             capture_output=True,
+            text=True,
             timeout=60,
         )
-        return result.returncode == 0
+        return result.stdout.rstrip("\n") if result.returncode == 0 else None
     except FileNotFoundError:
         syslog.syslog(
             syslog.LOG_ERR,
-            "zenity not found; install it (apt install zenity) or set up TOTP",
+            "zenity not found; install it (apt install zenity)",
         )
-        return False
+        return None
     except subprocess.TimeoutExpired:
-        syslog.syslog(syslog.LOG_WARNING, "zenity dialog timed out")
-        return False
+        syslog.syslog(syslog.LOG_WARNING, "zenity password dialog timed out")
+        return None
 
 
-def prompt_totp(identity: Path, user: str, host: str, command: str) -> bool:
-    """Headless approval: verify a TOTP code from ``$TOTP`` or /dev/tty."""
-    secret = load_totp_secret(identity)
-    if not secret:
-        return False
-
-    code = os.environ.get("TOTP", "").strip()
-    if code:
-        syslog.syslog(syslog.LOG_INFO, "TOTP code provided via $TOTP")
-    else:
-        try:
-            sys.stderr.write(
+def prompt_password_tty(user: str, host: str, command: str) -> str | None:
+    """Headless fallback: prompt for the sudo password on /dev/tty."""
+    try:
+        with open("/dev/tty", "w") as tty_out:
+            tty_out.write(
                 f"\n{'=' * 50}\nSUDO AUTHENTICATION REQUIRED\n{'=' * 50}\n"
-                f"User: {user}\nHost: {host}\nCommand: {command}\n"
-                f"{'-' * 50}\nEnter TOTP code to authorize: "
+                f"User: {user}\nHost: {host}\nCommand: {command}\n{'-' * 50}\n"
             )
-            sys.stderr.flush()
-            with open("/dev/tty") as tty:
-                code = tty.readline().strip()
-        except OSError:
-            sys.stderr.write("No TOTP code available. Set $TOTP or run from a terminal.\n")
-            return False
-
-    if not code:
-        return False
-
-    if verify_totp(secret, code):
-        sys.stderr.write("TOTP verified — access granted\n\n")
-        sys.stderr.flush()
-        syslog.syslog(syslog.LOG_INFO, "Sudo access approved via TOTP")
-        return True
-
-    sys.stderr.write("Invalid TOTP code — access denied\n\n")
-    sys.stderr.flush()
-    syslog.syslog(syslog.LOG_WARNING, "Invalid TOTP code provided")
-    return False
+            tty_out.flush()
+            return getpass.getpass("Sudo password: ", stream=tty_out) or None
+    except OSError:
+        return None
 
 
 def check_rate_limit(max_attempts: int, lockout_minutes: int) -> bool:
@@ -200,7 +156,7 @@ def _path_is_allowed(cwd: str, allowed: list[str]) -> bool:
     return False
 
 
-def check_security(config: dict[str, Any], identity: Path | None) -> bool:
+def check_security(config: dict[str, Any]) -> bool:
     if not check_rate_limit(config["max_attempts_per_hour"], config["lockout_minutes"]):
         return False
 
@@ -218,141 +174,7 @@ def check_security(config: dict[str, Any], identity: Path | None) -> bool:
         syslog.syslog(syslog.LOG_WARNING, "Askpass called without terminal/SSH env")
         return False
 
-    expiration_hours = config["expiration_hours"]
-    if expiration_hours > 0:
-        for blob in (AGE_ENCRYPTED_FILE, SSH_ENCRYPTED_FILE):
-            if blob.exists() and (time.time() - blob.stat().st_mtime) > expiration_hours * 3600:
-                syslog.syslog(
-                    syslog.LOG_INFO, f"Password expired after {expiration_hours}h; removing {blob}"
-                )
-                try:
-                    blob.unlink()
-                except OSError as e:
-                    syslog.syslog(syslog.LOG_WARNING, f"Could not remove expired {blob}: {e}")
-                return False
-
-    if config["require_user_confirmation"]:
-        user = os.environ.get("USER", "unknown")
-        host = socket.gethostname()
-        command = parent_command(os.getppid())
-        if "DISPLAY" in os.environ or sys.platform == "darwin":
-            approved = show_dialog(user, host, command)
-        else:
-            approved = prompt_totp(identity, user, host, command) if identity else False
-        if not approved:
-            syslog.syslog(syslog.LOG_WARNING, "Sudo access denied by user")
-            return False
-        syslog.syslog(syslog.LOG_INFO, "Sudo access approved by user")
-
     return True
-
-
-def prompt_passphrase(priv: Path) -> str | None:
-    """GUI prompt for SSH key passphrase (osascript on macOS, zenity on Linux)."""
-    if sys.platform == "darwin":
-        script = (
-            f'display dialog "Enter passphrase for {priv}:" '
-            'default answer "" with hidden answer '
-            'with title "SSH Key Passphrase Required" '
-            'with icon caution'
-        )
-        try:
-            result = subprocess.run(
-                ["osascript", "-e", script], capture_output=True, text=True, timeout=120
-            )
-            if result.returncode != 0:
-                return None
-            for part in result.stdout.split(", "):
-                if part.startswith("text returned:"):
-                    return part.removeprefix("text returned:").rstrip("\n")
-            return None
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            syslog.syslog(syslog.LOG_WARNING, f"osascript passphrase prompt failed: {e}")
-            return None
-
-    if "DISPLAY" not in os.environ:
-        return None
-
-    try:
-        result = subprocess.run(
-            ["zenity", "--password", "--title=SSH Key Passphrase Required"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        return result.stdout.rstrip("\n") if result.returncode == 0 else None
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        syslog.syslog(syslog.LOG_WARNING, f"zenity passphrase prompt failed: {e}")
-        return None
-
-
-def ensure_ssh_key_loaded(priv: Path) -> bool:
-    """Make sure ssh-agent holds the private key, prompting for passphrase if not."""
-    if not os.environ.get("SSH_AUTH_SOCK"):
-        syslog.syslog(syslog.LOG_ERR, "No SSH_AUTH_SOCK available; start ssh-agent first")
-        return False
-
-    try:
-        fingerprint_out = subprocess.run(
-            ["ssh-keygen", "-lf", str(priv)], capture_output=True, text=True
-        )
-        if fingerprint_out.returncode != 0:
-            return False
-        fingerprint = fingerprint_out.stdout.split()[1]
-
-        list_out = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
-        if list_out.returncode == 0 and fingerprint in list_out.stdout:
-            return True
-    except FileNotFoundError as e:
-        syslog.syslog(syslog.LOG_ERR, f"ssh tooling missing: {e}")
-        return False
-
-    passphrase = prompt_passphrase(priv)
-    if passphrase is None:
-        return False
-    add_result = subprocess.run(
-        ["ssh-add", str(priv)], input=passphrase.encode(), capture_output=True
-    )
-    return add_result.returncode == 0
-
-
-def decrypt_with_openssl(encrypted_file: Path, priv: Path, key_type: str) -> str | None:
-    """Decrypt a blob via OpenSSL for RSA / ECDSA / DSA keys."""
-    try:
-        encrypted = encrypted_file.read_bytes()
-    except OSError as e:
-        syslog.syslog(syslog.LOG_ERR, f"Cannot read {encrypted_file}: {e}")
-        return None
-
-    direct = subprocess.run(
-        ["openssl", "pkeyutl", "-decrypt", "-inkey", str(priv)],
-        input=encrypted,
-        capture_output=True,
-    )
-    if direct.returncode == 0:
-        return direct.stdout.decode().strip()
-
-    base_cmd = {
-        "RSA": ["openssl", "rsa", "-in", str(priv)],
-        "DSA": ["openssl", "dsa", "-in", str(priv)],
-        "ECDSA": ["openssl", "ec", "-in", str(priv)],
-    }.get(key_type, ["openssl", "pkey", "-in", str(priv)])
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as f:
-        temp_pem = f.name
-    try:
-        os.chmod(temp_pem, 0o600)
-        if subprocess.run([*base_cmd, "-out", temp_pem], capture_output=True).returncode != 0:
-            return None
-        result = subprocess.run(
-            ["openssl", "pkeyutl", "-decrypt", "-inkey", temp_pem],
-            input=encrypted,
-            capture_output=True,
-        )
-        return result.stdout.decode().strip() if result.returncode == 0 else None
-    finally:
-        if os.path.exists(temp_pem):
-            os.remove(temp_pem)
 
 
 def validate_script_integrity() -> bool:
@@ -384,7 +206,7 @@ def write_audit_entry(ppid: int, proc: str | None, command: str) -> None:
             "command": command,
             "user": os.environ.get("USER", "unknown"),
             "cwd": os.getcwd(),
-            "status": "approved",
+            "status": "prompted",
         }
         with AUDIT_LOG_FILE.open("a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -401,47 +223,30 @@ def main() -> None:
         sys.exit(1)
 
     config = load_config()
-    priv, _, key_type = find_ssh_key()
 
-    if not check_security(config, priv):
+    if not check_security(config):
         print("Error: security check failed", file=sys.stderr)
         syslog.syslog(syslog.LOG_ERR, "Security check failed")
         sys.exit(1)
 
     ppid = os.getppid()
-    write_audit_entry(ppid, process_name(ppid), parent_command(ppid))
+    command = parent_command(ppid)
+    write_audit_entry(ppid, process_name(ppid), command)
 
-    # Priority 1: age-encrypted file (Ed25519).
-    if AGE_ENCRYPTED_FILE.exists() and priv and has_age() and ensure_ssh_key_loaded(priv):
-        password = age_decrypt(AGE_ENCRYPTED_FILE.read_bytes(), priv)
-        if password:
-            print(password)
-            syslog.syslog(syslog.LOG_INFO, f"Password retrieved via age ({key_type} key)")
-            return
+    user = os.environ.get("USER", "unknown")
+    host = socket.gethostname()
 
-    # Priority 2: OpenSSL-encrypted file (RSA / ECDSA / DSA).
-    if SSH_ENCRYPTED_FILE.exists() and priv and key_type and key_type != "Ed25519":
-        password = decrypt_with_openssl(SSH_ENCRYPTED_FILE, priv, key_type)
-        if password:
-            print(password)
-            syslog.syslog(syslog.LOG_INFO, f"Password retrieved via SSH ({key_type} key)")
-            return
+    if "DISPLAY" in os.environ or sys.platform == "darwin":
+        password = prompt_password_gui(user, host, command)
+    else:
+        password = prompt_password_tty(user, host, command)
 
-    # Priority 3: system keyring.
-    if HAS_KEYRING:
-        try:
-            password = keyring.get_password(SERVICE_NAME, USERNAME)
-            if password:
-                print(password)
-                syslog.syslog(syslog.LOG_INFO, "Password retrieved via keyring")
-                return
-        except Exception as e:
-            syslog.syslog(syslog.LOG_WARNING, f"Keyring lookup failed: {e}")
+    if not password:
+        syslog.syslog(syslog.LOG_WARNING, "Sudo password prompt cancelled or empty")
+        print("Error: no password entered", file=sys.stderr)
+        sys.exit(1)
 
-    print("Error: no password found in secure storage", file=sys.stderr)
-    print("Use 'sudoplz set' to store the password securely", file=sys.stderr)
-    syslog.syslog(syslog.LOG_ERR, "No password found in secure storage")
-    sys.exit(1)
+    print(password)
 
 
 if __name__ == "__main__":

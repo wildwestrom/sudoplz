@@ -1,5 +1,5 @@
 {
-  description = "sudoplz - case-by-case sudo access for AI coding agents via GUI approval";
+  description = "sudoplz - case-by-case sudo access for AI coding agents via a GUI password prompt";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -12,10 +12,7 @@
         pkgs = import nixpkgs { inherit system; };
 
         runtimeDeps = with pkgs; [
-          age
           zenity
-          openssl
-          openssh
           procps
         ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
           # osascript ships with macOS itself
@@ -29,8 +26,6 @@
           src = ./.;
 
           build-system = with pkgs.python3Packages; [ hatchling ];
-
-          dependencies = with pkgs.python3Packages; [ keyring ];
 
           nativeBuildInputs = [ pkgs.makeWrapper ];
 

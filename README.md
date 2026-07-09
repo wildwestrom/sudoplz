@@ -1,10 +1,10 @@
 # sudoplz
 
-Give Claude Code, Cursor, and other AI coding agents the ability to run `sudo` — with case-by-case GUI approval, no passwordless sudo, no `/etc/sudoers` allowlists.
+Give Claude Code, Cursor, and other AI coding agents the ability to run `sudo` — with a real GUI password prompt every time, no passwordless sudo, no `/etc/sudoers` allowlists.
 
-Your sudo password is encrypted with your SSH private key and only decrypted after you approve a dialog showing the exact command about to run. Deny the dialog and nothing happens.
+`sudoplz` plugs into `sudo -A`. When the agent runs `sudo -A <command>`, a dialog pops up showing the exact command about to run, with a field to type your sudo password. Sudo validates it the normal way — `sudoplz` never stores your password or decides whether it's correct.
 
-![Sudo approval dialog showing a command about to run, with Deny and Allow buttons](assets/screenshot.png)
+![Sudo password dialog showing a command about to run](assets/screenshot.png)
 
 ## Why
 
@@ -14,9 +14,9 @@ Coding agents can't handle interactive terminal prompts. Ask Claude Code to run 
 - **`/etc/sudoers` allowlists** require predicting every command the agent will ever need. No case-by-case review.
 - **Manual copy-paste** is tedious and breaks the agent's flow.
 
-`sudoplz` plugs into `sudo -A`, so the agent runs `sudo -A <command>`, you see a dialog with the exact command, and you click Allow or Deny. Works for any command without pre-declaring what's permitted.
+`sudoplz` solves this by giving `sudo -A` a real GUI equivalent of the terminal password prompt: you see the exact command, you type your password, sudo checks it. No password is ever stored on disk.
 
-This threat model assumes a personal workstation with an encrypted disk and a passphrase-protected SSH key. Not appropriate for shared or production systems.
+This threat model assumes a personal workstation with an encrypted disk. Not appropriate for shared or production systems.
 
 ## Installation
 
@@ -25,27 +25,20 @@ This threat model assumes a personal workstation with an encrypted disk and a pa
    sudo update-alternatives --install /usr/bin/sudo sudo /usr/bin/sudo.ws 100
    sudo update-alternatives --config sudo   # pick sudo.ws
    ```
-2. Make sure you have an SSH key (ed25519, ecdsa, rsa, or dsa).
-3. Install system dependencies:
-   - [`age`](https://github.com/FiloSottile/age) — required if your SSH key is Ed25519 (the most common case today). `sudo pacman -S age` / `sudo apt install age` / `brew install age`.
-   - `zenity` on Linux — provides the GUI approval dialog. Pre-installed on most GNOME-based distros; `sudo apt install zenity` if missing. Not needed on macOS (uses AppleScript).
-4. Install from PyPI with [`uv`](https://docs.astral.sh/uv/):
+2. Install `zenity` on Linux — it provides the GUI password dialog. Pre-installed on most GNOME-based distros; `sudo apt install zenity` if missing. Not needed on macOS (uses AppleScript).
+3. Install from PyPI with [`uv`](https://docs.astral.sh/uv/):
    ```bash
    uv tool install sudoplz
    ```
    This puts `askpass` and `sudoplz` on your PATH. (For development: clone the repo and run `uv tool install .` instead.)
-5. Point `SUDO_ASKPASS` at the installed binary (add to `~/.bashrc`, `~/.zshrc`, etc.):
+4. Point `SUDO_ASKPASS` at the installed binary (add to `~/.bashrc`, `~/.zshrc`, etc.):
    ```bash
    export SUDO_ASKPASS="$(which askpass)"
-   ```
-6. Store your sudo password:
-   ```bash
-   sudoplz set
    ```
 
 ## Usage
 
-Your agent (or you) runs `sudo -A <command>`. A dialog pops up showing the command. You approve or deny.
+Your agent (or you) runs `sudo -A <command>`. A dialog pops up showing the command and asking for your sudo password. Type it (or cancel to deny).
 
 ```bash
 sudo -A apt install foo
@@ -61,90 +54,31 @@ sudoplz test
 
 ## Security
 
-### Encryption at rest
+`sudoplz` never stores, sees, or validates your password — it just relays what you type to `sudo`, which checks it the normal way (PAM/`/etc/shadow`). There's nothing on disk to steal.
 
-Passwords are encrypted with your SSH key:
+The askpass script still runs these checks on every invocation before it even shows the dialog; any failure means no prompt:
 
-- **Ed25519**: `age` encryption, stored at `~/.sudo_askpass.age`
-- **RSA/ECDSA/DSA**: OpenSSL asymmetric encryption, stored at `~/.sudo_askpass.ssh`
-
-Encrypted files have 600 permissions. Key preference: ed25519 > ecdsa > rsa > dsa. Falls back to the system keyring if available. Refuses plain text storage.
-
-### Defense in depth
-
-Encryption alone doesn't cover every abuse path — anything running as your user can in principle request decryption. The askpass script runs these checks on every invocation; any failure means no decryption:
-
-- **Caller path whitelist.** Only decrypts when the caller's working directory is on an allowlist (home, `/tmp`, etc.). Blocks invocations from unexpected locations like `/var/tmp/malicious`.
+- **Caller path whitelist.** Only prompts when the caller's working directory is on an allowlist (home, `/tmp`, etc.). Blocks invocations from unexpected locations like `/var/tmp/malicious`.
 - **Caller process whitelist.** Parent process must be on an allowlist (sudo, your shell, your IDE, your deploy tool). Keeps arbitrary binaries from invoking askpass directly.
-- **User confirmation.** A GUI dialog asks for approval on each decryption, so any sudo elevation you didn't initiate is visible and can be denied.
 - **Rate limiting.** Configurable max-attempts-per-hour and lockout window. Contains runaway scripts and brute-force attempts.
-- **Password expiration.** Stored passwords age out automatically (default: 1 week). A stolen blob becomes useless once it expires, even with your SSH key.
 
 Configure these in `~/.config/sudoplz/config.json` — an example is shipped as `askpass-config.json` in the repo; copy it and edit.
 
-### Why age for Ed25519?
+### Headless/SSH usage
 
-Ed25519 is a signing algorithm (EdDSA), not encryption. OpenSSL handles RSA encryption directly, but Ed25519 keys can't do asymmetric encryption at all. `age` was designed to work with SSH keys including Ed25519.
-
-### SSH key unlocking
-
-If your SSH key has a passphrase (recommended), the askpass tool will:
-
-1. Check whether the key is loaded in ssh-agent
-2. Prompt for the passphrase via GUI if it isn't
-3. Load the key into ssh-agent for the session
-
-You enter the passphrase once per session. After that, sudo commands only need the confirmation dialog. You need a running ssh-agent — most desktop environments start one on login; if not, `eval "$(ssh-agent -s)"` in your shell startup.
-
-This works under `sudo -A` even though sudo strips `SSH_AUTH_SOCK`: the script reconnects to your running ssh-agent.
+If there's no `DISPLAY` (e.g. an SSH session without X forwarding) and not macOS, askpass falls back to prompting for the password on `/dev/tty` instead of a GUI dialog.
 
 ## Commands
 
 ```bash
-sudoplz set        # Store password (terminal prompt; expires per config, 1 week default)
-sudoplz set-totp   # Store password with TOTP verification (headless)
-sudoplz totp-setup # Set up TOTP for headless sessions
-sudoplz get        # Check if password exists
-sudoplz clear      # Remove password
-sudoplz test       # Test sudo integration
-sudoplz audit      # Show recent askpass usage
-```
-
-## Headless/SSH usage with TOTP
-
-For servers or SSH sessions without a display, authenticate with TOTP.
-
-### Initial setup (run once from a GUI session)
-
-```bash
-sudoplz totp-setup
-```
-
-Prints a TOTP secret and an `otpauth://` URL to add to your authenticator app.
-
-### Setting a password from a headless session
-
-```bash
-sudoplz set-totp
-```
-
-Enter your 6-digit TOTP code, then your password.
-
-### Using sudo with TOTP
-
-When `DISPLAY` isn't set, askpass prompts for a TOTP code:
-
-```bash
-# Interactive — prompts for TOTP code
-sudo -A command
-
-# Non-interactive — pass TOTP via environment
-TOTP="123456" sudo -A command
+sudoplz test    # Test sudo integration
+sudoplz audit   # Show recent askpass usage
+sudoplz config  # View or modify rate-limit settings
 ```
 
 ## Credits
 
-The idea — an SSH-key-encrypted sudo password served via `SUDO_ASKPASS`, gated by a confirmation dialog — is from [GlassOnTin/secure-askpass](https://github.com/GlassOnTin/secure-askpass). That project is dormant; `sudoplz` is a substantially rewritten and cleaned up fork. Thanks to [@GlassOnTin](https://github.com/GlassOnTin) for the original idea.
+The idea — gating `sudo -A` behind a GUI prompt so coding agents can trigger sudo without a blind passwordless grant — traces back to [GlassOnTin/secure-askpass](https://github.com/GlassOnTin/secure-askpass), which used SSH-key-encrypted password storage plus a click-to-approve dialog. `sudoplz` started as a fork of that approach and now instead prompts for your real password on every invocation, so there's no stored secret and no approval step weaker than a password. Thanks to [@GlassOnTin](https://github.com/GlassOnTin) for the original idea.
 
 ## License
 
